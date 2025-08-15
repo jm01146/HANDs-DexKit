@@ -1,6 +1,7 @@
-from tkinter import *
 import customtkinter
+from tkinter import *
 from CTkMenuBar import *
+from portManager import Ports
 
 customtkinter.set_appearance_mode("dark")
 customtkinter.set_default_color_theme('green')
@@ -36,5 +37,79 @@ class GUI(customtkinter.CTk):
 
         self.bind('<Motion>', self.show_mouse_position)
 
+        # Creating the menu and options
+        self.menu = CTkTitleMenu(self, padx=10, x_offset=425, y_offset=12)
+        self.button_1 = self.menu.add_cascade("Comports", state='normal')
+        self.button_2 = self.menu.add_cascade('Home Device', command=self.send_home, state='normal')
+        self.button_3 = self.menu.add_cascade("E-Stop", command=self.eStop, state='normal')
+        self.button_4 = self.menu.add_cascade("Connect!", state='normal')
+
+        self.port_manager = Ports()
+        self.printing_port = self.port_manager.list_port()
+        self.setPort = None
+        self.eStopCounter = False
+
+        # Listing the possible port options on start up and readies for connection
+        self.dropdown1 = CustomDropdownMenu(widget=self.button_1, padx=2, pady=5, corner_radius=5, width=100)
+        for x in self.printing_port:
+            self.dropdown1.add_option(option=x, command=lambda r=x: self.set_port(r))
+
+        # Give the option to connect or disconnect from COM device
+        self.dropdown2 = CustomDropdownMenu(widget=self.button_4, padx=2, pady=5, corner_radius=5, width=100)
+        self.dropdown2.add_option(option="Connect", command=self.connect_device)
+        self.dropdown2.add_option(option="Disconnect", command=self.disconnect_device)
+
+
     def show_mouse_position(self, event):
         self.coords_label.configure(text=f"Mouse Position: X={event.x}, Y={event.y}")
+
+
+    def set_port(self, port):
+        self.port_manager.comm_selection(port)
+        print(f'{port} has been selected')
+
+
+    def send_home(self):
+        self.port_manager.send("G90 G21 G1 X0 Y0 F10000")
+        print('Sending home')
+
+
+    def eStop(self):
+        self.eStopCounter = True
+        self.button_3.configure(text='RESET', command=self.reset_device)
+        self.lock_controls(True)
+        self.port_manager.emergency_disconnet()
+        print('OH SHIT!')
+        print('Please reset before sending commands')
+
+
+    def reset_device(self):
+        self.eStopCounter = False
+        self.button_3.configure(text='E-Stop', command=self.eStop)
+        self.lock_controls(False)
+        self.port_manager.connect()
+        print('Back in motion')
+        print('Back to the mission...')
+
+
+    def lock_controls(self, locked=True):
+        state = "disabled" if locked else "normal"
+        self.button_1.configure(state=state)
+        self.button_2.configure(state=state)
+        self.button_4.configure(state=state)
+
+
+    def connect_device(self):
+        self.port_manager.connect()
+        print('Device connected')
+        self.port_manager.send(b"$H\n")
+        print('Homing the device...')
+        
+
+    def disconnect_device(self):
+        self.port_manager.send(b"$H\n")
+        print('Sending back home...')
+        self.port_manager.disconnect()
+        print('Device disconnect')
+
+        
