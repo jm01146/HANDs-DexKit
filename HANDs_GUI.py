@@ -6,7 +6,9 @@ import mediapipe as mp
 from tkinter import *
 from CTkMenuBar import *
 from portManager import Ports
+from testing_machineConversion import Convertor
 from PIL import Image, ImageTk
+import time
 
 customtkinter.set_appearance_mode("dark")
 customtkinter.set_default_color_theme('green')
@@ -28,6 +30,10 @@ class GUI(customtkinter.CTk):
         self.cam_running = False
         self.cam_loop_id = None
         self.cam_img_ref = None
+
+        self.x, self.y, self.z = 0, 0, 0
+        self.command_x, self.command_y, self.command_z = 0, 0, 0
+        self.convert = Convertor()
 
         self.rs_pipeline = None
         self.rs_align = None
@@ -51,9 +57,9 @@ class GUI(customtkinter.CTk):
         self.cameraFrame.place_forget()
         self.cam_label = customtkinter.CTkLabel(self.cameraFrame, text="")
         self.cam_label.pack(expand=True, fill='both', padx=10, pady=10)
-        self.close_cam_btn = customtkinter.CTkButton(
-            self.cameraFrame, text="Close Camera", command=self.disable_camera_control
-        )
+        # self.close_cam_btn = customtkinter.CTkButton(
+        #     self.cameraFrame, text="Close Camera", command=self.disable_camera_control
+        # )
 
         self.status = Label(self.statusFrame, text="FAMU-FSU Engineering Center",
                             bd=1, relief='sunken', anchor=W, font=('Tahoma', 15))
@@ -64,7 +70,8 @@ class GUI(customtkinter.CTk):
             self.interactiveFrame, text="Move the mouse inside the window", font=('Tahoma', 16)
         )
         self.coords_label.pack(anchor='nw', padx=10, pady=10)
-        self.bind('<Motion>', self.show_mouse_position)
+        self.bind("<Motion>", self.mouse_position)
+        self.bind("<MouseWheel>", self.scrollbar_position)
 
         # Creating the menu and options
         self.menu = CTkTitleMenu(self, padx=10, x_offset=425, y_offset=12)
@@ -92,9 +99,33 @@ class GUI(customtkinter.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
 
-    def show_mouse_position(self, event):
+    def update_display(self):
+        self.coords_label.configure(text=f"Mouse Position: X={self.x}, Y={self.y}, Z={self.z}")
+        print(f"X: {self.x}, Y: {self.y}, Z: {self.z}")
+
+
+    def mouse_position(self, event):
         if not self.cam_running:
-            self.coords_label.configure(text=f"Mouse Position: X={event.x}, Y={event.y}")
+            self.x, self.y = event.x, event.y
+            self.update_display()
+            command_x, command_y = self.convert.guiToGantry(self.x, self.y)
+            #self.port_manager.send(f'{self.command_x},{self.command_y},{self.command_z}\n')
+            # self.send(f"G90 G21 G1 X{command_x} Y{command_y} F10000\n")
+            self.port_manager.send(f"$J=X{command_x:.1f} Y{command_y:.1f} F5000\n")
+            # time.sleep(.5)
+            
+
+    def scrollbar_position(self, event):
+        if not self.cam_running:
+            if event.num == 5 or event.delta == -120:
+                self.z -= 1
+            elif event.num == 4 or event.delta == 120:
+                self.z += 1
+            command_z = self.convert.guiDepthToGantry(self.z)
+            self.port_manager.send(f"$J=Z{command_z:.1f} F5000\n")
+            #self.port_manager.send(f'{self.command_x},{self.command_y},{self.command_z}\n')
+            self.update_display()
+            # time.sleep(.5)
 
 
     def set_port(self, port):
@@ -103,7 +134,7 @@ class GUI(customtkinter.CTk):
 
 
     def send_home(self):
-        self.port_manager.send("G90 G21 G1 X0 Y0 F10000\n")
+        self.port_manager.send("$H\n")
         print('Sending home')
 
 
@@ -111,7 +142,7 @@ class GUI(customtkinter.CTk):
         self.eStopCounter = True
         self.button_3.configure(text='RESET', command=self.reset_device)
         self.lock_controls(True)
-        self.port_manager.emergency_disconnet()
+        self.port_manager.emergency_disconnect()
         print('OH SHIT!')
         print('Please reset before sending commands')
 
@@ -138,7 +169,8 @@ class GUI(customtkinter.CTk):
             return
         
         # Pause mouse tracking while camera overlay is up
-        self.unbind('<Motion>')
+        self.unbind("<Motion>")
+        self.unbind("<MouseWheel>")
         self.cam_running = True
         self.button_4.configure(text='Close Camera', command=self.disable_camera_control, state='normal')
 
@@ -223,6 +255,12 @@ class GUI(customtkinter.CTk):
 
                         # Depth in meters at center
                         z_m = depth_frame.get_distance(self.smoothed_cx, self.smoothed_cy)
+                        command_x, command_y = self.convert.cameraToGantry(self.smoothed_cx, self.smoothed_cy)
+                        command_z = self.convert.cameraDepthToGantry(z_m)
+
+                        # Send the detected hand's X, Y, Z coordinates 
+                        self.port_manager.send(f"$J=X{command_x:.1f} Y{command_y:.1f} Z{command_z:.1f} F10000\n")
+                        time.sleep(.5)
 
                         # Draw overlay
                         self.mp_drawing.draw_landmarks(color_image, hand_landmarks, mp.solutions.hands.HAND_CONNECTIONS)
@@ -232,7 +270,7 @@ class GUI(customtkinter.CTk):
 
                         self.coords_label.configure(text=f"Hand Center: X={self.smoothed_cx}, Y={self.smoothed_cy}, Z={z_m:.3f} m")
                     else:
-                        self.coords_label.configure(text="No hand detected… hold still like a statue 🗿")
+                        self.coords_label.configure(text="No hand detected… hold still like a statue")
 
                     # Render into the overlay label
                     disp_w = self.cameraFrame.winfo_width() or 800
@@ -284,7 +322,8 @@ class GUI(customtkinter.CTk):
 
         # Resume XY label updates
         self.cam_running = False
-        self.bind('<Motion>', self.show_mouse_position)
+        self.bind('<Motion>', self.mouse_position)
+        self.bind('<MouseWheel>', self.scrollbar_position)
         self.coords_label.configure(text="Move the mouse inside the window")
 
         # Restore menu item
@@ -295,13 +334,13 @@ class GUI(customtkinter.CTk):
     def connect_device(self):
         self.port_manager.connect()
         print('Device connected')
-        self.port_manager.send("$H\n")
-        print('Homing the device...')
+        # self.port_manager.send("$H\n")
+        # print('Homing the device...')
         
 
     def disconnect_device(self):
-        self.port_manager.send("$H\n")
-        print('Sending back home...')
+        # self.port_manager.send("$H\n")
+        # print('Sending back home...')
         self.port_manager.disconnect()
         print('Device disconnect')
 
