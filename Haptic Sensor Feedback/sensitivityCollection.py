@@ -1,249 +1,416 @@
+"""
+Magnetometer Data Logger with 3D Printer Control
+-------------------------------------------------
+Hardware:
+  - Teensy  → SENSOR_PORT  (outputs "x,y,z" float lines from QMC5883)
+  - Printer → PRINTER_PORT (G-code over USB, moves Z axis only)
+
+Key bindings (no Enter needed):
+  M  →  move printer to next Z position in POSITION_LIST_MM
+         (wraps back to the first position after the last)
+  R  →  record 1000 samples at current Z, save to Excel
+  H  →  home printer (G28)
+  Q  →  save and quit
+  ?  →  show help
+
+Rules:
+  - Movement is locked while a recording is in progress.
+  - Sessions accumulate across runs (workbook is appended, not overwritten).
+"""
+
+import os
+import sys
 import time
-import math
 import threading
 from datetime import datetime
 
 import serial
 from serial import SerialException
-
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Alignment
 
-# USER CONFIG
-SERIAL_PORT = "COM4"          # change this (e.g., "COM3" on Windows, "/dev/ttyACM0" on Linux)
-BAUD_RATE = 115200            # must match your microcontroller serial baud
-READ_TIMEOUT_S = 1.0
+# ── USER CONFIG ───────────────────────────────────────────────────────────────
+SENSOR_PORT         = "COM4"        # Teensy
+PRINTER_PORT        = "COM3"        # 3D printer
+BAUD_SENSOR         = 115200
+BAUD_PRINTER        = 115200
 
-OUTPUT_XLSX = "distanceRecording_someAxisChange_numberTrials.xlsx"
+OUTPUT_XLSX         = "Zaxis5_25Distance.xlsx"
+SAMPLES_PER_SESSION = 1000
+FEEDRATE            = 1000          # mm/min for Z moves
+HOME_ON_START       = False
 
-# How often to save the workbook (seconds)
-SAVE_EVERY_S = 10
+# Axis the printer moves on — prompted on launch, or hardcode "X"/"Y"/"Z" to skip prompt.
+MOVE_AXIS: str | None = None
 
-# Your allowed labels (mm). You can add more if needed.
-ALLOWED_DISTANCE_MM = [0, 1, 2, 5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+# Ordered list of positions (mm) to cycle through with M key.
+POSITION_LIST_MM = [0, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25]
 
-# GLOBAL STATE (current label)
-label_lock = threading.Lock()
-current_distance_mm = 0
-current_note = "standard"
+# Key bindings (single character, case-insensitive)
+KEY_MOVE   = "m"
+KEY_RECORD = "r"
+KEY_HOME   = "h"
+KEY_QUIT   = "q"
 
-def set_label(distance_mm: int, note: str = ""):
-    global current_distance_mm, current_note
-    with label_lock:
-        current_distance_mm = distance_mm
-        current_note = note if note else current_note
+# ── CROSS-PLATFORM SINGLE-KEYPRESS ────────────────────────────────────────────
+if sys.platform == "win32":
+    import msvcrt
 
+    def _getch():
+        return msvcrt.getwch()
 
-def get_label():
-    with label_lock:
-        return current_distance_mm, current_note
-    
+else:
+    import tty, termios
 
-def try_parse_bxyz(line: str):
-    """
-    Expects a line like:
-        "12.3,-45.6,78.9"
-    OR with labels:
-        "Bx:12.3,By:-45.6,Bz:78.9"
-    We will extract the first 3 numbers we find.
-    """
-    # Keep digits, minus, dot, comma, and spaces. Replace other stuff with space.
-    cleaned = []
-    for ch in line:
-        if ch.isdigit() or ch in "-., ":
-            cleaned.append(ch)
-        else:
-            cleaned.append(" ")
-    cleaned = "".join(cleaned)
-
-    # Split by commas first; fallback to whitespace
-    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    if len(parts) < 3:
-        parts = cleaned.split()
-
-    nums = []
-    for p in parts:
+    def _getch():
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
         try:
-            nums.append(float(p))
-        except ValueError:
-            continue
-        if len(nums) == 3:
-            break
-
-    if len(nums) != 3:
-        return None
-
-    bx, by, bz = nums
-    return bx, by, bz
+            tty.setraw(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def make_workbook():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "raw_log"
+# ── PRINTER ───────────────────────────────────────────────────────────────────
+class Printer:
+    # Making sure that the serial port is cleaned at start up of the code and connected properly
+    def __init__(self, port: str, baud: int):
+        self._ser  = serial.Serial(port, baud, timeout=2)
+        self._lock = threading.Lock()
+        time.sleep(2)
+        self._ser.reset_input_buffer()
+        self._flush_startup()
+# The actual flushing function of the code that will be used in __init__ (that is the start up method)
+    def _flush_startup(self):
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            line = self._ser.readline().decode("utf-8", errors="replace").strip()
+            if line:
+                print(f"  [printer] {line}")
+# How we will send instructions to the printer to move
+    def _send(self, cmd: str):
+        self._ser.write((cmd.strip() + "\n").encode())
+# We lock the python code until the printer says its okay to send another command 
+    def _wait_ok(self, timeout: float = 60.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = self._ser.readline()
+            if not raw:
+                continue
+            reply = raw.decode("utf-8", errors="replace").strip()
+            if reply:
+                print(f"  [printer] {reply}")
+            if reply.lower().startswith("ok"):
+                return True
+        raise TimeoutError("Printer did not reply 'ok' in time.")
+# Home command for the printer to avoid writing it constantly
+    def home(self):
+        with self._lock:
+            print("  Homing...")
+            self._send("G1 Z0 F1000")
+            self._wait_ok(timeout=120)
+            print("  Home complete.")
+# Set the axis you want to move in main and then how far you want to move per session 
+    def move_axis(self, axis: str, position_mm: float):
+        """Move one axis to an absolute position and block until physically complete."""
+        with self._lock:
+            self._send("G90")
+            self._wait_ok()
+            self._send(f"G1 {axis.upper()}{position_mm:.3f} F{FEEDRATE}")
+            self._wait_ok(timeout=60)
+            self._send("M400")
+            self._wait_ok(timeout=60)
+        print(f"  Printer at {axis.upper()}={position_mm:.3f} mm")
 
-    headers = [
-        "timestamp_iso",
-        "epoch_s",
-        "distance_mm",
-        "note",
-        "Bx_uT",
-        "By_uT",
-        "Bz_uT",
-        "Bmag_uT",
-        "raw_line",
-    ]
-    ws.append(headers)
-
-    # Make columns a bit wider (optional)
-    widths = [24, 12, 10, 10, 16, 10, 10, 10, 10, 40]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    return wb, ws
+    def close(self):
+        self._ser.close()
 
 
-def label_input_thread(stop_event: threading.Event):
-    """
-    Console thread: lets you change current label while logging.
-    Commands:
-      - type a mass in grams: 0,10,100,200,500,1000
-      - "note something" to set a note
-      - "help" to reprint
-      - "q" to quit
-    """
-    print("\nLabel control ready.")
-    print("Type one of these masses (g) to label data:", ALLOWED_DISTANCE_MM)
-    print('Optional: type "note baseline", or "note loading", etc.')
-    print('Type "q" then Enter to stop.\n')
+# ── SENSOR (Teensy) ───────────────────────────────────────────────────────────
+class SensorReader:
+    def __init__(self, port: str, baud: int):
+        self._ser     = serial.Serial(port, baud, timeout=1)
+        self._lock    = threading.Lock()
+        self._latest  = None          # (x, y, z) floats
+        self._running = True
+        time.sleep(1.5)
+        self._ser.reset_input_buffer()
+        threading.Thread(target=self._loop, daemon=True).start()
 
-    while not stop_event.is_set():
+    def _parse(self, line: str) -> tuple | None:
+        """Extract exactly 3 floats from a line like '1.23,-4.56,78.9'."""
+        cleaned = "".join(c if (c.isdigit() or c in "-., ") else " " for c in line)
+        parts   = [p for p in cleaned.replace(",", " ").split() if p]
+        nums    = []
+        for p in parts:
+            try:
+                nums.append(float(p))
+            except ValueError:
+                continue
+            if len(nums) == 3:
+                break
+        return tuple(nums) if len(nums) == 3 else None
+
+    def _loop(self):
+        while self._running:
+            try:
+                raw = self._ser.readline()
+            except SerialException:
+                break
+            if not raw:
+                continue
+            parsed = self._parse(raw.decode("utf-8", errors="replace").strip())
+            if parsed:
+                with self._lock:
+                    self._latest = parsed
+
+    def latest(self):
+        with self._lock:
+            return self._latest
+
+    def collect(self, n: int) -> list:
+        """Block until n distinct samples collected. Returns list of (x,y,z)."""
+        samples = []
+        prev    = None
+        print(f"  Recording {n} samples ", end="", flush=True)
+        while len(samples) < n:
+            s = self.latest()
+            if s is not None and s is not prev:
+                samples.append(s)
+                prev = s
+                if len(samples) % 100 == 0:
+                    print(".", end="", flush=True)
+            else:
+                time.sleep(0.001)
+        print(" done")
+        return samples
+
+    def stop(self):
+        self._running = False
+        self._ser.close()
+
+
+# ── EXCEL ─────────────────────────────────────────────────────────────────────
+RAW_HEADERS = [
+    "session_id", "timestamp_iso", "epoch_s",
+    "axis", "distance_mm", "sample_index",
+    "Bx_uT", "By_uT", "Bz_uT",
+]
+
+
+_HDR_FILL = PatternFill("solid", start_color="2F4F8F")
+_HDR_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+_CENTER   = Alignment(horizontal="center")
+
+
+def _style_headers(ws):
+    for cell in ws[1]:
+        cell.fill, cell.font, cell.alignment = _HDR_FILL, _HDR_FONT, _CENTER
+
+
+def open_or_create_workbook(path: str):
+    if os.path.exists(path):
+        wb      = load_workbook(path)
+        ws_raw  = wb["raw_samples"]
+        ws_stat = wb["session_stats"]
+    else:
+        wb = Workbook()
+
+        ws_raw       = wb.active
+        ws_raw.title = "raw_samples"
+        ws_raw.append(RAW_HEADERS)
+        _style_headers(ws_raw)
+        for i, w in enumerate([10, 24, 14, 6, 14, 12, 12, 12, 12], 1):
+            ws_raw.column_dimensions[get_column_letter(i)].width = w
+
+
+    return wb, ws_raw
+
+
+
+def append_session(ws_raw, session_id: int,
+                   axis: str, position_mm: float, samples: list):
+    ts  = datetime.now().isoformat(timespec="milliseconds")
+    now = time.time()
+
+    for i, (bx, by, bz) in enumerate(samples):
+        ws_raw.append([session_id, ts, now, axis, position_mm, i, bx, by, bz])
+
+
+
+# ── STATE ─────────────────────────────────────────────────────────────────────
+class State:
+    def __init__(self, axis: str):
+        self.axis       = axis.upper()
+        self.pos_index  = 0
+        self.position   = POSITION_LIST_MM[0]
+        self.recording  = threading.Event()
+
+    @property
+    def next_index(self):
+        return (self.pos_index + 1) % len(POSITION_LIST_MM)
+
+    def advance(self):
+        self.pos_index = self.next_index
+        self.position  = POSITION_LIST_MM[self.pos_index]
+        return self.pos_index
+
+
+# ── ACTIONS ───────────────────────────────────────────────────────────────────
+def action_move(printer: Printer, state: State):
+    if state.recording.is_set():
+        print("\n  Recording in progress — movement locked.\n")
+        return
+
+    new_idx  = state.advance()
+    pos      = state.position
+    total    = len(POSITION_LIST_MM)
+    wrapping = (new_idx == 0)
+    tag      = "  (back to start)" if wrapping else ""
+    print(f"\n  [{new_idx + 1}/{total}] Moving {state.axis} to {pos} mm{tag} ...")
+
+    def _move():
         try:
-            cmd = input().strip()
-        except EOFError:
-            stop_event.set()
-            break
-        except KeyboardInterrupt:
-            stop_event.set()
-            break
+            printer.move_axis(state.axis, pos)
+            nxt = POSITION_LIST_MM[state.next_index]
+            print(f"  Next M → {state.axis}={nxt} mm  |  Press R to record here.\n")
+        except (SerialException, TimeoutError) as e:
+            print(f"  Printer error: {e}\n")
 
-        if not cmd:
-            continue
+    threading.Thread(target=_move, daemon=True).start()
 
-        if cmd.lower() in ("q", "quit", "exit"):
-            stop_event.set()
-            break
 
-        if cmd.lower() == "help":
-            print("Commands:")
-            print("  0 | 1 | 2 | 5 | 10 | ... |   (set weight label in mm)")
-            print('  note <text>                  (set note text)')
-            print("  q                            (quit)")
-            continue
+def action_record(sensor: SensorReader, state: State,
+                  wb, ws_raw,
+                  session_counter: list, xlsx_path: str):
+    if state.recording.is_set():
+        print("\n  Already recording — wait for it to finish.\n")
+        return
 
-        if cmd.lower().startswith("note "):
-            note = cmd[5:].strip()
-            if note:
-                with label_lock:
-                    global current_note
-                    current_note = note
-                print(f"Note set to: {note}")
-            continue
+    state.recording.set()
 
-        # Try interpret as mass label
+    def _run():
         try:
-            distance_mm = int(cmd)
-        except ValueError:
-            print("Didn’t understand. Type 'help' for commands.")
-            continue
+            sid = session_counter[0]
+            pos = state.position
+            print(f"\n  Session {sid} | {state.axis}={pos} mm")
+            samples = sensor.collect(SAMPLES_PER_SESSION)
+            append_session(ws_raw, sid, state.axis, pos, samples)
+            wb.save(xlsx_path)
+            print(f"  Session {sid} saved → {xlsx_path}\n")
+            session_counter[0] += 1
+        finally:
+            state.recording.clear()
 
-        if distance_mm not in ALLOWED_DISTANCE_MM:
-            print(f"Mass must be one of: {ALLOWED_DISTANCE_MM}")
-            continue
+    threading.Thread(target=_run, daemon=True).start()
 
-        set_label(distance_mm)
-        d, note = get_label()
-        print(f"Label set: distance_mm={d}, note={note}")
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def print_help(state: State):
+    total = len(POSITION_LIST_MM)
+    cur   = state.position
+    nxt   = POSITION_LIST_MM[state.next_index]
+    print(f"""
+  ┌─────────────────────────────────────────────────────┐
+  │  Key    Action                                      │
+  │  ─────────────────────────────────────────────────  │
+  │  {KEY_MOVE.upper()}      Move {state.axis} to next position (cycles)    │
+  │  {KEY_RECORD.upper()}      Record {SAMPLES_PER_SESSION} samples at current pos        │
+  │  {KEY_HOME.upper()}      Home printer (G28)                   │
+  │  {KEY_QUIT.upper()}      Save and quit                         │
+  │  ?      Show this help                              │
+  └─────────────────────────────────────────────────────┘
+  Axis: {state.axis}   |   Positions ({total}): {POSITION_LIST_MM}
+  Current: {cur} mm   |   Next M → {state.axis}={nxt} mm
+""")
 
 
 def main():
-    print("Starting magnet force data logger...")
-    print(f"Port: {SERIAL_PORT}  Baud: {BAUD_RATE}")
-    print(f"Output: {OUTPUT_XLSX}")
-    print("IMPORTANT: Your serial device must output Bx,By,Bz each line.\n")
+    print("=== Magnetometer + Printer Logger ===")
+    print(f"Sensor  : {SENSOR_PORT}  @ {BAUD_SENSOR}  (Teensy / QMC5883)")
+    print(f"Printer : {PRINTER_PORT} @ {BAUD_PRINTER}")
+    print(f"Output  : {OUTPUT_XLSX}\n")
 
-    wb, ws = make_workbook()
+    # Resolve axis — use config value or prompt
+    axis = MOVE_AXIS
+    if axis is None:
+        while True:
+            raw = input("  Which axis will the printer move on? [X/Y/Z]: ").strip().upper()
+            if raw in ("X", "Y", "Z"):
+                axis = raw
+                break
+            print("  Please enter X, Y, or Z.")
+    else:
+        axis = axis.upper()
+        if axis not in ("X", "Y", "Z"):
+            print(f"  Invalid MOVE_AXIS '{axis}' in config. Must be X, Y, or Z.")
+            return
+        print(f"  Axis: {axis} (from config)")
+    print()
 
-    stop_event = threading.Event()
-    t = threading.Thread(target=label_input_thread, args=(stop_event,), daemon=True)
-    t.start()
+    wb, ws_raw = open_or_create_workbook(OUTPUT_XLSX)
 
-    last_save = time.time()
-    row_count = 0
+    print("Connecting to printer...")
+    try:
+        printer = Printer(PRINTER_PORT, BAUD_PRINTER)
+    except SerialException as e:
+        print(f"Could not open printer port: {e}")
+        return
+
+    print("Connecting to Teensy sensor...")
+    try:
+        sensor = SensorReader(SENSOR_PORT, BAUD_SENSOR)
+    except SerialException as e:
+        print(f"Could not open sensor port: {e}")
+        printer.close()
+        return
+
+    if HOME_ON_START:
+        printer.home()
+
+    state           = State(axis)
+    session_counter = [1]
+
+    print_help(state)
+    print("Press a key...\n")
 
     try:
-        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=READ_TIMEOUT_S) as ser:
-            # Give serial a second to settle (especially on Arduino reset)
-            time.sleep(1.5)
-            ser.reset_input_buffer()
+        while True:
+            key = _getch().lower()
 
-            print("Logging... (change labels by typing in console; 'q' to quit)\n")
+            if key == KEY_QUIT:
+                print("\nQuitting...")
+                break
 
-            while not stop_event.is_set():
-                try:
-                    raw = ser.readline()
-                except SerialException as e:
-                    print(f"Serial error: {e}")
-                    break
+            elif key == KEY_MOVE:
+                action_move(printer, state)
 
-                if not raw:
-                    continue
+            elif key == KEY_RECORD:
+                action_record(sensor, state,
+                              wb, ws_raw,
+                              session_counter, OUTPUT_XLSX)
 
-                try:
-                    line = raw.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    continue
+            elif key == KEY_HOME:
+                if state.recording.is_set():
+                    print("\n  Recording in progress — movement locked.\n")
+                else:
+                    print("\n  Homing...")
+                    threading.Thread(target=printer.home, daemon=True).start()
 
-                parsed = try_parse_bxyz(line)
-                if parsed is None:
-                    # Still log it if you want to debug format issues:
-                    # comment this out if you only want valid numeric rows.
-                    ts = datetime.now().isoformat(timespec="milliseconds")
-                    epoch = time.time()
-                    d, note = get_label()
-                    ws.append([ts, epoch, d, note, None, None, None, None, line])
-                    row_count += 1
-                    continue
-
-                bx, by, bz = parsed
-                bmag = math.sqrt(bx * bx + by * by + bz * bz)
-
-                ts = datetime.now().isoformat(timespec="milliseconds")
-                epoch = time.time()
-                d, note = get_label()
-
-                ws.append([ts, epoch, d, note, bx, by, bz, bmag, line])
-                row_count += 1
-
-                # Periodic save
-                now = time.time()
-                if (now - last_save) >= SAVE_EVERY_S:
-                    wb.save(OUTPUT_XLSX)
-                    last_save = now
-                    print(f"Saved {row_count} rows... current label: {d} mm, note='{note}'")
+            elif key == "?":
+                print_help(state)
 
     except KeyboardInterrupt:
-        stop_event.set()
-    except SerialException as e:
-        print(f"Could not open serial port: {e}")
+        pass
 
-    # Final save
-    try:
+    finally:
         wb.save(OUTPUT_XLSX)
-        print(f"\nFinal save complete. Total rows: {row_count}")
-        print(f"File written: {OUTPUT_XLSX}")
-    except Exception as e:
-        print(f"Failed to save workbook: {e}")
+        sensor.stop()
+        printer.close()
+        total = session_counter[0] - 1
+        print(f"\nDone. {total} session(s) recorded → {OUTPUT_XLSX}")
 
 
 if __name__ == "__main__":
