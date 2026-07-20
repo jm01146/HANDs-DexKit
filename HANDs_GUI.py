@@ -38,7 +38,7 @@ class GUI(customtkinter.CTk):
         self.rs_pipeline = None
         self.rs_align = None
         self.mphands = None
-        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing = mp.tasks.vision
         self.smoothed_cx, self.smoothed_cy = None, None
 
         self.mainFrame = customtkinter.CTkFrame(self)
@@ -72,6 +72,7 @@ class GUI(customtkinter.CTk):
         self.coords_label.pack(anchor='nw', padx=10, pady=10)
         self.bind("<Motion>", self.mouse_position)
         self.bind("<MouseWheel>", self.scrollbar_position)
+        self.bind("<Key>", self.keyboard_control)
 
         # Creating the menu and options
         self.menu = CTkTitleMenu(self, padx=10, x_offset=425, y_offset=12)
@@ -127,6 +128,21 @@ class GUI(customtkinter.CTk):
             self.update_display()
             # time.sleep(.5)
 
+    def keyboard_control(self, event):
+        step = 5
+        if event.keysym == "w":
+            # jog_x += step
+            self.port_manager.send(f"$J=G91 G21 X{step} F5000\n")
+        if event.keysym == "s":
+            # self.x -= step
+            self.port_manager.send(f"$J=G91 G21 X-{step} F5000\n")
+        if event.keysym == "d":
+            # jog_x += step
+            self.port_manager.send(f"$J=G91 G21 Y{step} F5000\n")
+        if event.keysym == "a":
+            # self.x -= step
+            self.port_manager.send(f"$J=G91 G21 Y-{step} F5000\n")
+
 
     def set_port(self, port):
         self.port_manager.comm_selection(port)
@@ -171,6 +187,7 @@ class GUI(customtkinter.CTk):
         # Pause mouse tracking while camera overlay is up
         self.unbind("<Motion>")
         self.unbind("<MouseWheel>")
+        self.unbind("<Key>")
         self.cam_running = True
         self.button_4.configure(text='Close Camera', command=self.disable_camera_control, state='normal')
 
@@ -324,6 +341,7 @@ class GUI(customtkinter.CTk):
         self.cam_running = False
         self.bind('<Motion>', self.mouse_position)
         self.bind('<MouseWheel>', self.scrollbar_position)
+        self.bind("<Key>", self.keyboard_control)
         self.coords_label.configure(text="Move the mouse inside the window")
 
         # Restore menu item
