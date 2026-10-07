@@ -31,12 +31,12 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # ── USER CONFIG ───────────────────────────────────────────────────────────────
-SENSOR_PORT         = "COM4"        # Teensy
-PRINTER_PORT        = "COM3"        # 3D printer
+SENSOR_PORT         = "COM3"        # Teensy
+PRINTER_PORT        = "COM5"        # 3D printer
 BAUD_SENSOR         = 115200
 BAUD_PRINTER        = 115200
 
-OUTPUT_XLSX         = "Zaxis5_25Distance.xlsx"
+OUTPUT_XLSX         = "TM_Xaxis_neg3_3Distance_Z0.xlsx"
 SAMPLES_PER_SESSION = 1000
 FEEDRATE            = 1000          # mm/min for Z moves
 HOME_ON_START       = False
@@ -45,8 +45,8 @@ HOME_ON_START       = False
 MOVE_AXIS: str | None = None
 
 # Ordered list of positions (mm) to cycle through with M key.
-POSITION_LIST_MM = [0, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25]
-
+# POSITION_LIST_MM = [5, 4.8, 4.5, 4.3, 4, 3.8, 3.5, 3.3, 3, 2.8, 2.5, 2.3, 2, 1.8, 1.5, 1.3, 1, 0.8, 0.5, 0.3, 0] Z motion
+POSITION_LIST_MM = [0, 0.3, 0.5, 0.8, 1.0, 1.3, 1.5, 1.8, 2.0, 2.3, 2.5, 2.8, 3.0, 3.3, 3.5, 3.8, 4.0, 4.3, 4.5, 4.8, 5.0, 5.3, 5.5, 5.8, 6]
 # Key bindings (single character, case-insensitive)
 KEY_MOVE   = "m"
 KEY_RECORD = "r"
@@ -75,24 +75,23 @@ else:
 
 # ── PRINTER ───────────────────────────────────────────────────────────────────
 class Printer:
-    # Making sure that the serial port is cleaned at start up of the code and connected properly
     def __init__(self, port: str, baud: int):
         self._ser  = serial.Serial(port, baud, timeout=2)
         self._lock = threading.Lock()
         time.sleep(2)
         self._ser.reset_input_buffer()
         self._flush_startup()
-# The actual flushing function of the code that will be used in __init__ (that is the start up method)
+
     def _flush_startup(self):
         deadline = time.time() + 3
         while time.time() < deadline:
             line = self._ser.readline().decode("utf-8", errors="replace").strip()
             if line:
                 print(f"  [printer] {line}")
-# How we will send instructions to the printer to move
+
     def _send(self, cmd: str):
         self._ser.write((cmd.strip() + "\n").encode())
-# We lock the python code until the printer says its okay to send another command 
+
     def _wait_ok(self, timeout: float = 60.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -105,20 +104,20 @@ class Printer:
             if reply.lower().startswith("ok"):
                 return True
         raise TimeoutError("Printer did not reply 'ok' in time.")
-# Home command for the printer to avoid writing it constantly
-    def home(self):
+
+    def set_position(self):
         with self._lock:
-            print("  Homing...")
-            self._send("G1 Z0 F1000")
+            print("  Setting...")
+            self._send("G92 Z5.0")
             self._wait_ok(timeout=120)
             print("  Home complete.")
-# Set the axis you want to move in main and then how far you want to move per session 
+
     def move_axis(self, axis: str, position_mm: float):
         """Move one axis to an absolute position and block until physically complete."""
         with self._lock:
             self._send("G90")
             self._wait_ok()
-            self._send(f"G1 {axis.upper()}{position_mm:.3f} F{FEEDRATE}")
+            self._send(f"G0 {axis.upper()}{position_mm:.3f} F{FEEDRATE}")
             self._wait_ok(timeout=60)
             self._send("M400")
             self._wait_ok(timeout=60)
@@ -368,7 +367,7 @@ def main():
         return
 
     if HOME_ON_START:
-        printer.home()
+        printer.set_position()
 
     state           = State(axis)
     session_counter = [1]
@@ -397,7 +396,7 @@ def main():
                     print("\n  Recording in progress — movement locked.\n")
                 else:
                     print("\n  Homing...")
-                    threading.Thread(target=printer.home, daemon=True).start()
+                    threading.Thread(target=printer.set_position, daemon=True).start()
 
             elif key == "?":
                 print_help(state)
