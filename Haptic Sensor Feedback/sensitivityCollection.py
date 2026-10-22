@@ -4,15 +4,16 @@ Magnetometer Data Logger with 3D Printer Control
 Hardware:
   - Teensy  → SENSOR_PORT  (outputs "x,y,z" float lines from QMC5883)
   - Printer → PRINTER_PORT (G-code over USB, moves Z axis only)
-
+ 
 Key bindings (no Enter needed):
   M  →  move printer to next Z position in POSITION_LIST_MM
          (wraps back to the first position after the last)
   R  →  record 1000 samples at current Z, save to Excel
-  H  →  home printer (G28)
+  H  →  home printer First Index of Position_MM
+  S  →  Set at specified position (Use only if lowering Z until 0 rather than 0 to Z+)
   Q  →  save and quit
   ?  →  show help
-
+ 
 Rules:
   - Movement is locked while a recording is in progress.
   - Sessions accumulate across runs (workbook is appended, not overwritten).
@@ -23,7 +24,7 @@ import sys
 import time
 import threading
 from datetime import datetime
-
+ 
 import serial
 from serial import SerialException
 from openpyxl import Workbook, load_workbook
@@ -31,15 +32,15 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # ── USER CONFIG ───────────────────────────────────────────────────────────────
-SENSOR_PORT         = "COM3"        # Teensy
-PRINTER_PORT        = "COM5"        # 3D printer
+SENSOR_PORT         = "/dev/ttyACM0" # Teensy
+PRINTER_PORT        = "/dev/ttyUSB0" # 3D printer
 BAUD_SENSOR         = 115200
 BAUD_PRINTER        = 115200
 
-OUTPUT_XLSX         = "TM_Xaxis_neg3_3Distance_Z0.xlsx"
+OUTPUT_XLSX         = "Yaxis_neg3_3Distance_Z5.xlsx"
 SAMPLES_PER_SESSION = 1000
-FEEDRATE            = 1000          # mm/min for Z moves
-HOME_ON_START       = False
+FEEDRATE            = 1000 # mm/min for Z moves
+HOME_ON_START       = False # if True machine moves to first index of position_mm
 
 # Axis the printer moves on — prompted on launch, or hardcode "X"/"Y"/"Z" to skip prompt.
 MOVE_AXIS: str | None = None
@@ -47,10 +48,12 @@ MOVE_AXIS: str | None = None
 # Ordered list of positions (mm) to cycle through with M key.
 # POSITION_LIST_MM = [5, 4.8, 4.5, 4.3, 4, 3.8, 3.5, 3.3, 3, 2.8, 2.5, 2.3, 2, 1.8, 1.5, 1.3, 1, 0.8, 0.5, 0.3, 0] Z motion
 POSITION_LIST_MM = [0, 0.3, 0.5, 0.8, 1.0, 1.3, 1.5, 1.8, 2.0, 2.3, 2.5, 2.8, 3.0, 3.3, 3.5, 3.8, 4.0, 4.3, 4.5, 4.8, 5.0, 5.3, 5.5, 5.8, 6]
+
 # Key bindings (single character, case-insensitive)
 KEY_MOVE   = "m"
 KEY_RECORD = "r"
 KEY_HOME   = "h"
+KEY_SET    = "s"
 KEY_QUIT   = "q"
 
 # ── CROSS-PLATFORM SINGLE-KEYPRESS ────────────────────────────────────────────
@@ -105,6 +108,13 @@ class Printer:
                 return True
         raise TimeoutError("Printer did not reply 'ok' in time.")
 
+    def return_to_start(self, axis: str):
+        """Move back to the first position in the list (experiment start point)."""
+        start = POSITION_LIST_MM[0]
+        print(f"  Returning to start ({axis}={start} mm)...")
+        self.move_axis(axis, start)
+        print("  At start position.")
+
     def set_position(self):
         with self._lock:
             print("  Setting...")
@@ -117,7 +127,7 @@ class Printer:
         with self._lock:
             self._send("G90")
             self._wait_ok()
-            self._send(f"G0 {axis.upper()}{position_mm:.3f} F{FEEDRATE}")
+            self._send(f"G1 {axis.upper()}{position_mm:.3f} F{FEEDRATE}")
             self._wait_ok(timeout=60)
             self._send("M400")
             self._wait_ok(timeout=60)
@@ -211,22 +221,18 @@ def _style_headers(ws):
 
 def open_or_create_workbook(path: str):
     if os.path.exists(path):
-        wb      = load_workbook(path)
-        ws_raw  = wb["raw_samples"]
-        ws_stat = wb["session_stats"]
+        wb = load_workbook(path)
+        ws_raw = wb["raw_samples"]
     else:
         wb = Workbook()
-
-        ws_raw       = wb.active
+        ws_raw = wb.active
         ws_raw.title = "raw_samples"
         ws_raw.append(RAW_HEADERS)
         _style_headers(ws_raw)
         for i, w in enumerate([10, 24, 14, 6, 14, 12, 12, 12, 12], 1):
             ws_raw.column_dimensions[get_column_letter(i)].width = w
 
-
     return wb, ws_raw
-
 
 
 def append_session(ws_raw, session_id: int,
@@ -238,14 +244,13 @@ def append_session(ws_raw, session_id: int,
         ws_raw.append([session_id, ts, now, axis, position_mm, i, bx, by, bz])
 
 
-
 # ── STATE ─────────────────────────────────────────────────────────────────────
 class State:
     def __init__(self, axis: str):
-        self.axis       = axis.upper()
-        self.pos_index  = 0
-        self.position   = POSITION_LIST_MM[0]
-        self.recording  = threading.Event()
+        self.axis = axis.upper()
+        self.pos_index = 0
+        self.position = POSITION_LIST_MM[0]
+        self.recording = threading.Event()
 
     @property
     def next_index(self):
@@ -253,7 +258,7 @@ class State:
 
     def advance(self):
         self.pos_index = self.next_index
-        self.position  = POSITION_LIST_MM[self.pos_index]
+        self.position = POSITION_LIST_MM[self.pos_index]
         return self.pos_index
 
 
@@ -264,10 +269,10 @@ def action_move(printer: Printer, state: State):
         return
 
     new_idx  = state.advance()
-    pos      = state.position
-    total    = len(POSITION_LIST_MM)
+    pos = state.position
+    total = len(POSITION_LIST_MM)
     wrapping = (new_idx == 0)
-    tag      = "  (back to start)" if wrapping else ""
+    tag = "  (back to start)" if wrapping else ""
     print(f"\n  [{new_idx + 1}/{total}] Moving {state.axis} to {pos} mm{tag} ...")
 
     def _move():
@@ -281,9 +286,8 @@ def action_move(printer: Printer, state: State):
     threading.Thread(target=_move, daemon=True).start()
 
 
-def action_record(sensor: SensorReader, state: State,
-                  wb, ws_raw,
-                  session_counter: list, xlsx_path: str):
+def action_record(sensor: SensorReader, printer: Printer, state: State,
+                  wb, ws_raw, session_counter: list, xlsx_path: str):
     if state.recording.is_set():
         print("\n  Already recording — wait for it to finish.\n")
         return
@@ -303,6 +307,42 @@ def action_record(sensor: SensorReader, state: State,
         finally:
             state.recording.clear()
 
+        # Auto-advance to next position, or end the cycle
+        total = len(POSITION_LIST_MM)
+        is_last = (state.pos_index == total - 1)
+ 
+        if is_last:
+            # Cycle complete — go home and wait for the user to decide
+            print(f"\n  Cycle complete ({total}/{total} positions recorded).")
+            try:
+                printer.return_to_start(state.axis)
+            except (SerialException, TimeoutError) as e:
+                print(f"  Printer error returning to start: {e}")
+            state.pos_index = 0
+            state.position = POSITION_LIST_MM[0]
+            print("\n  ┌─────────────────────────────────────────┐")
+            print("  │  Cycle done. Printer at start position. │")
+            print(f"  │  R  →  start a new cycle from pos 1    │")
+            print(f"  │  Q  →  save and quit                   │")
+            print("  └─────────────────────────────────────────┘\n")
+        else:
+            new_idx = state.advance()
+            print(f"\n  [{new_idx + 1}/{total}] Auto-moving {state.axis} to {state.position} mm ...")
+            try:
+                printer.move_axis(state.axis, state.position)
+                nxt = POSITION_LIST_MM[state.next_index] if new_idx < total - 1 else None
+                if nxt is not None:
+                    print(f"  Recording now...  (after this → {state.axis}={nxt} mm)\n")
+                else:
+                    print(f"  Recording now...  (this is the last position)\n")
+            except (SerialException, TimeoutError) as e:
+                print(f"  Printer error during auto-move: {e}\n")
+                return
+ 
+            # Immediately trigger recording at the new position
+            action_record(sensor, printer, state,
+                          wb, ws_raw, session_counter, xlsx_path)
+
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -315,10 +355,13 @@ def print_help(state: State):
   ┌─────────────────────────────────────────────────────┐
   │  Key    Action                                      │
   │  ─────────────────────────────────────────────────  │
-  │  {KEY_MOVE.upper()}      Move {state.axis} to next position (cycles)    │
-  │  {KEY_RECORD.upper()}      Record {SAMPLES_PER_SESSION} samples at current pos        │
-  │  {KEY_HOME.upper()}      Home printer (G28)                   │
-  │  {KEY_QUIT.upper()}      Save and quit                         │
+  │  {KEY_MOVE.upper()}     Move {state.axis} to next   |
+  |                         position (cycles)           │
+  │  {KEY_RECORD.upper()}   Record {SAMPLES_PER_SESSION}|
+  |                         samples at current pos      │
+  │  {KEY_HOME.upper()}     Home printer                │
+  |  {KEY_SET.upper()}      Set at speficifed Position  |
+  │  {KEY_QUIT.upper()}     Save and quit               │
   │  ?      Show this help                              │
   └─────────────────────────────────────────────────────┘
   Axis: {state.axis}   |   Positions ({total}): {POSITION_LIST_MM}
@@ -369,7 +412,7 @@ def main():
     if HOME_ON_START:
         printer.set_position()
 
-    state           = State(axis)
+    state = State(axis)
     session_counter = [1]
 
     print_help(state)
@@ -387,16 +430,28 @@ def main():
                 action_move(printer, state)
 
             elif key == KEY_RECORD:
-                action_record(sensor, state,
-                              wb, ws_raw,
-                              session_counter, OUTPUT_XLSX)
+                action_record(sensor, printer, state,
+                              wb, ws_raw, session_counter, OUTPUT_XLSX)
+
+            elif key == KEY_SET:
+                if state.recording.is_set():
+                    print("\n  Recording in progress — movement locked.\n")
+                else:
+                    print("\n  Setting...")
+                    threading.Thread(target=printer.set_position, daemon=True).start()
 
             elif key == KEY_HOME:
                 if state.recording.is_set():
                     print("\n  Recording in progress — movement locked.\n")
                 else:
-                    print("\n  Homing...")
-                    threading.Thread(target=printer.set_position, daemon=True).start()
+                    def _go_start():
+                        try:
+                            printer.return_to_start(state.axis)
+                            state.pos_index = 0
+                            state.position  = POSITION_LIST_MM[0]
+                        except (SerialException, TimeoutError) as e:
+                            print(f"  Error: {e}\n")
+                    threading.Thread(target=_go_start, daemon=True).start()
 
             elif key == "?":
                 print_help(state)
